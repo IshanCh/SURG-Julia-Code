@@ -1,0 +1,154 @@
+using LinearAlgebra # Operations
+using Random # Random Number Generator
+using Graphs # Network Structure
+using GLMakie # Visualization & Plotting
+
+# Function to convert a graph to a simple directed half-digraph
+function graph_to_half_digraph(G)
+    N = nv(G) # Nodes in G
+    g = SimpleDiGraph(N) # New Directed Graph w/ N Nodes
+    edge_index = 1 # Edge Index Counter
+    edge_map = Dict{Edge{Int}, Int}() # Empty Dictionary to Map Edges to Indices
+    for e in edges(G) # Iterates over each Edge E in Graph G
+        i = src(e) # Retrieves Source Node
+        j = dst(e) # Retrieves Destination Node
+        if i < j
+            add_edge!(g, i, j) # Adds the directed edge i -> j to the new graph g
+            edge_map[Edge(i, j)] = edge_index # Maps this edge to the current index 
+            edge_index += 1 # Increments the edge index
+        end
+    end
+    return g, edge_map
+end
+
+# Function to generate list of matrices A and b for each node
+function generate_data(N, seed=2)
+    Random.seed!(seed) # Reproducibility
+    A_list = [] # List to store matrices A for each node
+    b_list = [] # List to store vectors b for each node
+    colA = rand(4:10) # Number of columns between 4 and 10
+    
+    for i in 1:N
+        rowA = rand(11:20) # Random number of rows between 11 and 20 for each node
+        A_i = hcat(ones(rowA), rand(rowA, colA - 1)) # Create matrix A_i with rowA rows and colA columns
+        b_i = rand(rowA) # Create vector b_i with rowA elements
+        push!(A_list, A_i) # Add A_i to the list
+        push!(b_list, b_i) # Add b_i to the list
+    end
+    
+    global_A = reduce(vcat, A_list) # Concatenate all A matrices vertically
+    global_b = reduce(vcat, b_list) # Concatenate all b vectors vertically
+    global_x = global_A \ global_b # Calculate the global solution global_x
+    
+    return A_list, b_list, global_x, colA
+end
+
+# Hybrid distributed ADMM function
+function hybrid_distributed_admm(G, k, gamma, ρ, w, A_list, b_list, global_x, colA, w_star=0.1, seed=2)
+    N = nv(G) # Nodes in G
+    g, edge_map = graph_to_half_digraph(G)
+    x = zeros(colA, N, k + 1) # 3D Matrix x with colA columns, N rows, and k+1 depth
+    
+    M = ne(g) # Number of edges
+    θ = zeros(colA, M, k + 1) # 3D Matrix θ with colA columns, M Edges, and k+1 depth (auxiliary variable estimates for each edge)
+    λ = zeros(colA, N, k + 1) # 3D Matrix λ with colA columns, N rows, and k+1 depth (node states)
+    
+    threshold_crossed = false # Flag to check if the threshold has been crossed
+    errors = [] # Array to store error values
+    
+    # Calculate r_i for all nodes based on their degree
+    r = [ρ * degree(G, i) for i in 1:N]
+    
+    final_iteration = k # Initialize final_iteration to k
+    
+    for iteration in 1:k # Main loop to iterate the ADMM algorithm for a specified number of iterations
+        for i in 1:N # Iterate over each node
+            A_i = A_list[i]  # Extract matrix A_i for node i
+            b_i = b_list[i]  # Extract vector b_i for node i
+            
+            # Equation 48
+            x_i_next = (A_i' * A_i + r[i] * I(colA)) \ (A_i' * b_i .+ λ[:, i, iteration]) # Update x
+            x[:, i, iteration + 1] .= x_i_next
+        end
+        for e in edges(g) # Iterate over each edge
+            i = src(e) # Retrieves Source Node
+            j = dst(e) # Retrieves Destination Node
+            edge_index = edge_map[e] # Get the edge index
+            
+            # Equation 44
+            θ[:, edge_index, iteration + 1] = θ[:, edge_index, iteration] + w * (x[:, j, iteration + 1] - x[:, i, iteration + 1])
+        end
+        for i in 1:N # Iterate over each node for lambda update
+            sum_out_theta = zeros(colA) # Initialize sum of outgoing θ to 0
+            sum_in_theta = zeros(colA) # Initialize sum of incoming θ to 0
+            for j in outneighbors(g, i) # Iterates over the outgoing neighbors of node i
+                edge = Edge(i, j)
+                sum_out_theta += θ[:, edge_map[edge], iteration + 1]
+            end
+            for j in inneighbors(g, i) # Iterates over the incoming neighbors of node i
+                edge = Edge(j, i)
+                sum_in_theta += θ[:, edge_map[edge], iteration + 1]
+            end
+            
+            # Corrected Equation 47
+            λ[:, i, iteration + 1] = gamma * λ[:, i, iteration] + (1 - gamma) * (
+                r[i] * x[:, i, iteration + 1]
+                - sum(w_star * (x[:, i, iteration + 1] - x[:, j, iteration + 1]) for j in neighbors(G, i))
+                + sum_out_theta - sum_in_theta
+            )
+        end
+        
+        max_error = maximum(norm.(x[:, :, iteration + 1] .- global_x, 2)) # Calculate the maximum error at this iteration
+        push!(errors, max_error)
+
+        if iteration % 100 == 0
+            println("Iteration $iteration, max error: $max_error")
+        end
+        
+        if isnan(max_error) || isinf(max_error)
+            println("Algorithm diverged at iteration $iteration")
+            final_iteration = iteration
+            break
+        end
+
+        if max_error <= 3.000000000000000e-5 && !threshold_crossed
+            println("Iteration when max_error <= 3.000000000000000e-5: $iteration")
+            println("-----------------------------------------------------------------------------------------Break")
+            threshold_crossed = true
+        end
+
+    end
+    
+    println("Hybrid ADMM algorithm completed.")
+    return x, global_x, θ, λ, errors, final_iteration
+end
+
+# Main execution
+N = 50 # Nodes
+k = 10000 # Iterations
+gamma = 0.1 # Adjusted Gain parameter gamma
+ρ = 0.1 # R-ADMM penalty parameter
+w = 0.08 # Edge weight w
+
+# Generate data
+A_list, b_list, global_x, colA = generate_data(N)
+
+Random.seed!(123) 
+G = erdos_renyi(N, 0.2)
+# G, positions = euclidean_graph(N, 2, cutoff = .9)
+# G = barabasi_albert(N, 80, is_directed=false, complete=true)
+is_connected(G) || println("Warning: graph is not connected")
+x_values, global_x, θ_values, λ_values, errors, final_iteration = hybrid_distributed_admm(G, k, gamma, ρ, w, A_list, b_list, global_x, colA)
+
+# Print the final solutions
+println("Final solutions (x values):")
+for i in 1:N
+    println("Node $i: ", x_values[:, i, end])
+end
+
+# Plot the errors on a log scale using GLMakie
+fig = Figure(size = (300, 150)) # Use size instead of resolution
+ax = Axis(fig[1, 1], xlabel = "Iterations", ylabel = "Log(Error)", title = "Error Decrease Over Iterations")
+lines!(ax, 1:final_iteration, log.(errors))
+display(fig)
+readline()
