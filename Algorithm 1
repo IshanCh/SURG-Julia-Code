@@ -1,0 +1,131 @@
+using LinearAlgebra # Operations
+using Random # Random Number Generator
+using Graphs # Network Structure
+using GLMakie # Visualization & Plotting
+
+# Function to convert a graph to a simple directed half-digraph
+function graph_to_digraph(G)
+    N = nv(G) # Nodes in G
+    g = SimpleDiGraph(N) # New Directed Graph w/ N Nodes
+    edge_index = 1 # Edge Index Counter
+    edge_map = Dict{Edge{Int}, Int}() # Empty Dictionary to Map Edges to Indices
+    for e in edges(G) # Iterates over each Edge E in Graph G
+        i = src(e) # Retrieves Source Node
+        j = dst(e) # Retrieves Destination Node
+        add_edge!(g, i, j) # Adds the directed edge i -> j to the new graph g
+        edge_map[Edge(i, j)] = edge_index # Maps this edge to the current index 
+        edge_index += 1 # Increments the edge index
+        add_edge!(g, j, i) # Same for directed edge j -> i
+        edge_map[Edge(j, i)] = edge_index
+        edge_index += 1
+    end
+    return g, edge_map
+end
+
+# Function to generate list of matrices A and b for each node
+function generate_data(N, seed=2)
+    Random.seed!(seed) # Reproducibility
+    A_list = [] # List to store matrices A for each node
+    b_list = [] # List to store vectors b for each node
+    colA = rand(4:10) # Number of columns between 4 and 10
+    
+    for i in 1:N
+        rowA = rand(11:20) # Random number of rows between 11 and 20 for each node
+        A_i = hcat(ones(rowA), rand(rowA, colA - 1)) # Create matrix A_i with rowA rows and colA columns
+        b_i = rand(rowA) # Create vector b_i with rowA elements
+        push!(A_list, A_i) # Add A_i to the list
+        push!(b_list, b_i) # Add b_i to the list
+    end
+    
+    global_A = reduce(vcat, A_list) # Concatenate all A matrices vertically
+    global_b = reduce(vcat, b_list) # Concatenate all b vectors vertically
+    global_x = global_A \ global_b # Calculate the global solution global_x
+    
+    return A_list, b_list, global_x, colA
+end
+
+# Distributed ADMM function
+function distributed_admm(G, k, A_list, b_list, global_x, colA, ρ=0.1, α=0.1, seed=2)
+    N = nv(G) # Nodes in G
+    g, edge_map = graph_to_digraph(G)
+
+    x = zeros(colA, N, k + 1) # 3D Matrix x with colA columns, N rows, and k+1 depth
+    
+    M = ne(g) # Number of edges
+    z = zeros(colA, 2M, k + 1) # 3D Matrix z with colA columns, 2M Edges, and k+1 depth (auxiliary variable estimates for each edge)
+
+    threshold_crossed = false # Flag to check if the threshold has been crossed
+    errors = [] # Array to store error values
+
+    for iteration in 1:k # Main loop to iterate the ADMM algorithm for a specified number of iterations
+        for i in 1:N # Iterate over each node
+            A_i = A_list[i]  # Extract matrix A_i for node i
+            b_i = b_list[i]  # Extract vector b_i for node i
+
+            sum_z = zeros(colA) # Initialize z to 0
+            for j in outneighbors(g, i) # Iterates over the neighbors of node i
+                edge = Edge(i, j)
+                sum_z += z[:, edge_map[edge], iteration] # Sums corresponding z values
+            end
+            
+            x_i_next = (A_i' * A_i + ρ * indegree(g, i) * I(colA)) \ (A_i' * b_i .+ sum_z)  # Equation 13a
+            x[:, i, iteration + 1] .= x_i_next
+        end
+
+        for e in edges(g) # Iterate over each edge
+            i = src(e) # Retrieves Source Node
+            j = dst(e) # Retrieves Destination Node
+
+            edge_index = edge_map[e] # Get the edge indices & its reciprocals
+            reciprocal_edge = Edge(j, i)
+            reciprocal_edge_index = edge_map[reciprocal_edge]
+
+            q = -z[:, reciprocal_edge_index, iteration] + 2ρ * x[:, j, iteration + 1]
+            z[:, edge_index, iteration + 1] = (1 - α) * z[:, edge_index, iteration] + α * q  # Equation 15
+        end
+        
+        max_error = maximum(norm.(x[:, :, iteration + 1] .- global_x, 2)) # Calculate the maximum error at this iteration
+        push!(errors, max_error)
+
+        if iteration % 100 == 0
+            println("Iteration $iteration, max error: $max_error")
+        end
+
+        if max_error <= 3.000000000000000e-5 && !threshold_crossed
+            println("Iteration when max_error <= 3.000000000000000e-5: $iteration")
+            println("-----------------------------------------------------------------------------------------Break")
+            threshold_crossed = true
+        end
+        
+    end
+    
+    println("ADMM algorithm completed.")
+    return x, global_x, z, errors
+end
+
+# Main execution
+N = 100 # Nodes
+k = 10000 # Iterations
+Random.seed!(123) 
+# G = erdos_renyi(N, 0.8)
+# G, positions = euclidean_graph(N, 2, cutoff = .9)
+G = barabasi_albert(N, 80, is_directed=false, complete=true)
+is_connected(G) || println("Warning: graph is not connected")
+
+# Generate data
+A_list, b_list, global_x, colA = generate_data(N)
+
+x_values, global_x, z_values, errors = distributed_admm(G, k, A_list, b_list, global_x, colA)
+
+# Print the final solutions
+println("Final solutions (x values):")
+for i in 1:N
+    println("Node $i: ", x_values[:, i, end])
+end
+
+# Plot the errors on a log scale using GLMakie
+fig = Figure(size = (300, 150)) # Use size instead of resolution
+ax = Axis(fig[1, 1], xlabel = "Iterations", ylabel = "Log(Error)", title = "Error Decrease Over Iterations")
+lines!(ax, 1:k, log.(errors))
+display(fig)
+readline()
